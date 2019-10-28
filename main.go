@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -15,7 +14,6 @@ import (
 	"github.com/golang/geo/s2"
 	_ "github.com/lib/pq"
 	"github.com/pkg/errors"
-	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -26,26 +24,28 @@ const (
 
 	queryMinLevel    = 8
 	queryMaxLevel    = 20 // ~ 1 meter
-	queryMaxCount    = (queryMaxLevel - queryMinLevel + 1) * 100
 	querySelectivity = 1
 	queryShape       = cellShape
 
+	latenciesMaxCount     = (queryMaxLevel - queryMinLevel + 1) * 100
+	throughputMaxDuration = time.Second
+
 	updateInterval    = time.Second
-	earthRadiusMeters = 6378137 // lol which radius, it's not a sphere
+	earthRadiusMeters = 6371010 // From the c++ s2 library.
 )
 
-var cfg = &crdbIndexConfig{
+var cfg = &s2IndexConfig{
 	minLevel: 0,
 	maxLevel: 30,
-	maxCells: 4,
+	maxCells: 1,
 }
 
-type crdbIndexConfig struct {
+type s2IndexConfig struct {
 	minLevel, maxLevel, maxCells int
 	rc                           *s2.RegionCoverer
 }
 
-func (c *crdbIndexConfig) Covering(r s2.Region) []s2.CellID {
+func (c *s2IndexConfig) Covering(r s2.Region) []s2.CellID {
 	if c, ok := r.(s2.Cell); ok {
 		return []s2.CellID{c.ID()}
 	}
@@ -60,7 +60,7 @@ func (c *crdbIndexConfig) Covering(r s2.Region) []s2.CellID {
 	return covering
 }
 
-func convert(in, table, index string, cfg *crdbIndexConfig) error {
+func convert(in, table, index string, cfg *s2IndexConfig) error {
 	rr, err := makeRoadReader(in)
 	if err != nil {
 		return err
@@ -80,7 +80,6 @@ func convert(in, table, index string, cfg *crdbIndexConfig) error {
 
 	start := time.Now()
 	lastUpdate := start
-	var cellsBuf bytes.Buffer
 	for i := 0; i < convertRows; {
 		road, ok := rr.Next()
 		if !ok {
@@ -98,15 +97,10 @@ func convert(in, table, index string, cfg *crdbIndexConfig) error {
 			continue
 		}
 		i++
-		cellsBuf.Reset()
-		for i, c := range covering {
-			fmt.Fprintf(indexW, `%d,%s`+"\n", road.idx, c)
-			if i != 0 {
-				cellsBuf.WriteString(`,`)
-			}
-			cellsBuf.WriteString(c.ToToken())
+		for _, c := range covering {
+			fmt.Fprintf(indexW, `%d,%s`+"\n", road.idx, c.ToToken())
 		}
-		fmt.Fprintf(tableW, `%d,%s,"%s","%s"`+"\n", road.idx, name, cellsBuf.String(), road.geometry)
+		fmt.Fprintf(tableW, `%d,"%s","%s"`+"\n", road.idx, name, road.geometry)
 	}
 	if err := tableW.Sync(); err != nil {
 		return err
@@ -128,21 +122,23 @@ func crdbLoad(conn, table, index string) error {
 	if _, err := db.Exec(`DROP TABLE IF EXISTS roads`); err != nil {
 		return errors.Wrapf(err, "dropping existing data")
 	}
-	if _, err := db.Exec(`DROP TABLE IF EXISTS roads_s2_idx`); err != nil {
-		return errors.Wrapf(err, "dropping existing data")
-	}
-	const importStmt = `IMPORT TABLE roads (id INT PRIMARY KEY, name STRING, covering STRING, geometry STRING) CSV DATA ($1)`
+	const importStmt = `IMPORT TABLE roads (id INT PRIMARY KEY, name STRING, geometry STRING) CSV DATA ($1)`
 	if _, err := db.Exec(importStmt, table); err != nil {
 		return errors.Wrapf(err, "importing: %s", table)
 	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS roads_s2_idx`); err != nil {
+		return errors.Wrapf(err, "dropping existing data")
+	}
+	start := time.Now()
 	const importIdxStmt = `IMPORT TABLE roads_s2_idx (id INT, s2 STRING, PRIMARY KEY(s2, id)) CSV DATA ($1)`
 	if _, err := db.Exec(importIdxStmt, index); err != nil {
 		return errors.Wrapf(err, "importing: %s", index)
 	}
+	fmt.Printf("loaded in %s\n", time.Since(start))
 	return nil
 }
 
-func pgLoad(conn, table string) error {
+func pgLoad(conn, table, index string) error {
 	db, err := sql.Open("postgres", conn)
 	if err != nil {
 		return errors.Wrapf(err, "connecting to: %s", conn)
@@ -153,16 +149,48 @@ func pgLoad(conn, table string) error {
 	if _, err := db.Exec(`CREATE TABLE roads (id INT PRIMARY KEY, name VARCHAR, geometry GEOMETRY)`); err != nil {
 		return errors.Wrapf(err, "creating table")
 	}
+	start := time.Now()
 	if _, err := db.Exec(`COPY roads (id, name, geometry) FROM '` + table + `' CSV DELIMITER ','`); err != nil {
 		return errors.Wrapf(err, "creating table")
 	}
+	fmt.Printf("loaded in %s\n", time.Since(start))
+	start = time.Now()
 	if _, err := db.Exec(`CREATE INDEX ON roads USING GIST (geometry)`); err != nil {
+		return errors.Wrapf(err, "creating table")
+	}
+	fmt.Printf("created index in %s\n", time.Since(start))
+	if _, err := db.Exec(`DROP TABLE IF EXISTS roads_s2_idx`); err != nil {
+		return errors.Wrapf(err, "dropping existing data")
+	}
+	if _, err := db.Exec(`CREATE TABLE roads_s2_idx (id INT, s2 VARCHAR, PRIMARY KEY(s2, id))`); err != nil {
+		return errors.Wrapf(err, "creating table")
+	}
+	if _, err := db.Exec(`COPY roads_s2_idx (id, s2) FROM '` + index + `' CSV DELIMITER ','`); err != nil {
 		return errors.Wrapf(err, "creating table")
 	}
 	return nil
 }
 
-func run(conn, file string, cfg *crdbIndexConfig) error {
+func ctrlcCtx() (ctx context.Context, cancel func()) {
+	ctx, cancel = context.WithCancel(context.Background())
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, os.Interrupt)
+	go func() {
+		select {
+		case <-signalChan:
+			fmt.Println("\nReceived an interrupt, stopping...")
+			signal.Reset(os.Interrupt)
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
+
+func latencies(conn, file string, cfg *s2IndexConfig) error {
+	ctx, cancel := ctrlcCtx()
+	defer cancel()
+
 	db, err := sql.Open("postgres", conn)
 	if err != nil {
 		return errors.Wrapf(err, "connecting to: %s", conn)
@@ -190,9 +218,44 @@ func run(conn, file string, cfg *crdbIndexConfig) error {
 			return err
 		}
 
-		if err := doRun(cfg, qr, db, nanosByLevel, countsByLevel); err != nil {
-			return err
+		start := time.Now()
+		lastUpdate := start
+		level := -1
+		for i := 0; i < latenciesMaxCount; level-- {
+			if err := ctx.Err(); err != nil {
+				break
+			}
+			q, ok := qr.Next()
+			if !ok {
+				break
+			}
+			if now := time.Now(); now.Sub(lastUpdate) > updateInterval {
+				lastUpdate = now
+				fmt.Printf("finished %d queries in %s\n", i, now.Sub(start))
+			}
+
+			if level < queryMinLevel {
+				level = queryMaxLevel
+			}
+			qStart := time.Now()
+			var count int64
+			var err error
+			if cfg != nil {
+				count, err = q.ReadS2(db, cfg, level)
+			} else {
+				count, err = q.ReadPostGIS(db, level)
+			}
+			qDuration := time.Since(qStart)
+			if err == errQuerySkipped {
+				continue
+			} else if err != nil {
+				return err
+			}
+			i++
+			nanosByLevel[level].RecordValue(qDuration.Nanoseconds())
+			countsByLevel[level].RecordValue(count)
 		}
+
 		fmt.Printf("finished query type %s shape %s\n", queryOp, queryShape)
 		fmt.Println("level__meters_____numQ_pMin(ms)__p50(ms)__p95(ms)__p99(ms)_pMax(ms)__count50__count95__count99_countMax")
 		for level := range nanosByLevel {
@@ -215,72 +278,12 @@ func run(conn, file string, cfg *crdbIndexConfig) error {
 				countsHist.Max(),
 			)
 		}
+		if err := ctx.Err(); err != nil {
+			return nil
+		}
 	}
 
 	return nil
-}
-
-func doRun(
-	cfg *crdbIndexConfig,
-	qr *queryReader,
-	db *sql.DB,
-	nanosByLevel, countsByLevel []*hdrhistogram.Histogram,
-) error {
-	ctx, cancel := context.WithCancel(context.Background())
-	g, ctx := errgroup.WithContext(ctx)
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, os.Interrupt)
-	g.Go(func() error {
-		defer cancel()
-		select {
-		case <-ctx.Done():
-		case <-signalChan:
-			fmt.Printf("\nReceived an interrupt, stopping...\n")
-			signal.Reset(os.Interrupt)
-		}
-		return nil
-	})
-	g.Go(func() error {
-		defer cancel()
-		start := time.Now()
-		lastUpdate := start
-		for i := 0; i < queryMaxCount; {
-			if err := ctx.Err(); err != nil {
-				return nil
-			}
-			q, ok := qr.Next()
-			if !ok {
-				break
-			}
-			if now := time.Now(); now.Sub(lastUpdate) > updateInterval {
-				lastUpdate = now
-				fmt.Printf("finished %d queries in %s\n", i, now.Sub(start))
-			}
-
-			qStart := time.Now()
-			var level int
-			var count int64
-			var err error
-			if cfg != nil {
-				level, count, err = q.RunCRDB(db, cfg)
-			} else {
-				level, count, err = q.RunPostgres(db)
-			}
-			if err != nil {
-				return err
-			}
-
-			// A level < 0 means non-error skip.
-			if level < 0 {
-				continue
-			}
-			i++
-			nanosByLevel[level].RecordValue(time.Since(qStart).Nanoseconds())
-			countsByLevel[level].RecordValue(count)
-		}
-		return nil
-	})
-	return g.Wait()
 }
 
 func main() {
@@ -307,22 +310,22 @@ func main() {
 		}
 	case `pgload`:
 		subArgs := args[1:]
-		if len(subArgs) != 2 {
-			log.Fatalf("usage: %s pgload <conn> <table.csv>", os.Args[0])
+		if len(subArgs) != 3 {
+			log.Fatalf("usage: %s pgload <conn> <table.csv> <index.csv>", os.Args[0])
 		}
-		if err := pgLoad(subArgs[0], subArgs[1]); err != nil {
+		if err := pgLoad(subArgs[0], subArgs[1], subArgs[2]); err != nil {
 			log.Fatal(err)
 		}
-	case `crdbquery`, `pgquery`:
+	case `s2latencies`, `pglatencies`:
 		subArgs := args[1:]
 		if len(subArgs) != 2 {
 			log.Fatalf("usage: %s %s <conn> <data.csv.bz2>", os.Args[0], args[0])
 		}
-		var crdbCfg *crdbIndexConfig
-		if args[0] == `crdbquery` {
-			crdbCfg = cfg
+		var s2Cfg *s2IndexConfig
+		if args[0] == `s2latencies` {
+			s2Cfg = cfg
 		}
-		if err := run(subArgs[0], subArgs[1], crdbCfg); err != nil {
+		if err := latencies(subArgs[0], subArgs[1], s2Cfg); err != nil {
 			log.Fatal(err)
 		}
 	default:

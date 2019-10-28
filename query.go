@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"database/sql"
 	"fmt"
-	"math"
 	"math/rand"
 
 	"github.com/golang/geo/s1"
@@ -38,7 +37,7 @@ func arcFromLevel(level int) float64 {
 }
 
 func metersFromLevel(level int) float64 {
-	return float64(earthRadiusMeters) * arcFromLevel(level) / (2 * math.Pi)
+	return float64(earthRadiusMeters) * arcFromLevel(level)
 }
 
 type queryReader struct {
@@ -48,7 +47,6 @@ type queryReader struct {
 	op          operationType
 
 	center s2.LatLng
-	level  int
 }
 
 func makeQueryReader(path string, selectivity int, queryOp operationType) (*queryReader, error) {
@@ -61,29 +59,12 @@ func makeQueryReader(path string, selectivity int, queryOp operationType) (*quer
 		rng:         rand.New(rand.NewSource(0)),
 		selectivity: selectivity,
 		op:          queryOp,
-		level:       -1,
 	}
 	return qr, nil
 }
 
-func (qr *queryReader) NextPoint() (query, bool) {
-	qr.level = -1
-	return qr.Next()
-}
-
 func (qr *queryReader) Next() (query, bool) {
 	for {
-		if qr.level >= queryMinLevel {
-			q := query{
-				center: qr.center,
-				level:  qr.level,
-				shape:  queryShape,
-				op:     qr.op,
-			}
-			qr.level--
-			return q, true
-		}
-
 		road, ok := qr.rr.Next()
 		if !ok {
 			return query{}, false
@@ -91,13 +72,16 @@ func (qr *queryReader) Next() (query, bool) {
 		if !(qr.rng.Intn(100) < qr.selectivity) {
 			continue
 		}
-		qr.center = road.lls[0]
-		qr.level = queryMaxLevel
+		q := query{
+			center: road.lls[0],
+			shape:  queryShape,
+			op:     qr.op,
+		}
+		return q, ok
 	}
 }
 
 type query struct {
-	level  int
 	center s2.LatLng
 
 	shape shapeType
@@ -124,14 +108,12 @@ func ancestorCells(cells ...s2.CellID) []s2.CellID {
 }
 
 func containsQ(w *bytes.Buffer, cells []s2.CellID) {
-	w.WriteString(`s2 LIKE`)
 	for i, c := range cells {
 		if i != 0 {
-			w.WriteString(` OR S2 LIKE `)
+			w.WriteString(` OR `)
 		}
-		fmt.Fprintf(w, `'%s%%'`, c.String())
+		fmt.Fprintf(w, `s2 BETWEEN '%s' AND '%s'`, c.RangeMin().ToToken(), c.RangeMax().ToToken())
 	}
-	// w.WriteString(`)`)
 }
 
 func containingQ(w *bytes.Buffer, cells []s2.CellID) {
@@ -140,21 +122,23 @@ func containingQ(w *bytes.Buffer, cells []s2.CellID) {
 		if i != 0 {
 			w.WriteString(`, `)
 		}
-		fmt.Fprintf(w, `'%s'`, c.String())
+		fmt.Fprintf(w, `'%s'`, c.ToToken())
 	}
 	w.WriteString(`)`)
 }
 
-func (q query) RunCRDB(db *sql.DB, cfg *crdbIndexConfig) (int, int64, error) {
+var errQuerySkipped = errors.New(`skipped`)
+
+func (q query) ReadS2(db *sql.DB, cfg *s2IndexConfig, level int) (int64, error) {
 	var r s2.Region
 	switch q.shape {
 	case cellShape:
-		r = s2.CellFromCellID(s2.CellIDFromLatLng(q.center).Parent(q.level))
+		r = s2.CellFromCellID(s2.CellIDFromLatLng(q.center).Parent(level))
 	case capShape:
-		arc := s1.Angle(arcFromLevel(q.level))
+		arc := s1.Angle(arcFromLevel(level))
 		r = s2.CapFromCenterAngle(s2.PointFromLatLng(q.center), arc)
 	case rectShape:
-		cell := s2.CellFromCellID(s2.CellIDFromLatLng(q.center).Parent(q.level))
+		cell := s2.CellFromCellID(s2.CellIDFromLatLng(q.center).Parent(level))
 		rect := s2.NewRectBounder()
 		rect.AddPoint(cell.Vertex(0))
 		rect.AddPoint(cell.Vertex(2))
@@ -165,12 +149,12 @@ func (q query) RunCRDB(db *sql.DB, cfg *crdbIndexConfig) (int, int64, error) {
 	covering := cfg.Covering(r)
 	if covering == nil {
 		// Couldn't do this covering.
-		return -1, 0, nil
+		return 0, errQuerySkipped
 	}
 
 	var queryBuf bytes.Buffer
 	queryBuf.WriteString(`SELECT `)
-	if cfg.maxCells == 1 {
+	if cfg.maxCells == 1 || true {
 		// Take advantage of the fact that there's only one cell indexed for each
 		// shape.
 		queryBuf.WriteString(`count(id)`)
@@ -198,14 +182,14 @@ func (q query) RunCRDB(db *sql.DB, cfg *crdbIndexConfig) (int, int64, error) {
 	var count int64
 	err := db.QueryRow(queryBuf.String()).Scan(&count)
 	err = errors.Wrapf(err, `executing: %s`, queryBuf.String())
-	return q.level, count, err
+	return count, err
 }
 
-func (q query) RunPostgres(db *sql.DB) (int, int64, error) {
+func (q query) ReadPostGIS(db *sql.DB, level int) (int64, error) {
 	var geom string
 	switch q.shape {
 	case cellShape, rectShape:
-		cell := s2.CellFromCellID(s2.CellIDFromLatLng(q.center).Parent(q.level))
+		cell := s2.CellFromCellID(s2.CellIDFromLatLng(q.center).Parent(level))
 		v0, v2 := s2.LatLngFromPoint(cell.Vertex(0)), s2.LatLngFromPoint(cell.Vertex(2))
 		// Yeah, lng and lat and swapped from what you'd expect.
 		geom = fmt.Sprintf(`ST_MakeEnvelope(%v, %v, %v, %v)`,
@@ -213,7 +197,7 @@ func (q query) RunPostgres(db *sql.DB) (int, int64, error) {
 	case capShape:
 		// Yeah, lng and lat and swapped from what you'd expect.
 		geom = fmt.Sprintf(`ST_Buffer(ST_MakePoint(%v, %v)::geography, %d)::geometry`,
-			q.center.Lng.Degrees(), q.center.Lat.Degrees(), int(metersFromLevel(q.level)))
+			q.center.Lng.Degrees(), q.center.Lat.Degrees(), int(metersFromLevel(level)))
 	default:
 		panic(`unhandled shape: ` + q.shape)
 	}
@@ -237,5 +221,5 @@ func (q query) RunPostgres(db *sql.DB) (int, int64, error) {
 	var count int64
 	err := db.QueryRow(query).Scan(&count)
 	err = errors.Wrapf(err, `executing: %s`, query)
-	return q.level, count, err
+	return count, err
 }
