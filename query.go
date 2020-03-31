@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"database/sql"
+	"encoding/binary"
 	"fmt"
-	"math/rand"
-
+	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/sstable"
 	"github.com/golang/geo/s1"
 	"github.com/golang/geo/s2"
 	"github.com/pkg/errors"
+	"math/rand"
 )
 
 type shapeType string
@@ -128,8 +130,9 @@ func containingQ(w *bytes.Buffer, cells []s2.CellID) {
 }
 
 var errQuerySkipped = errors.New(`skipped`)
+var queryCoveringCounts [20]int64
 
-func (q query) ReadS2(db *sql.DB, cfg *s2IndexConfig, level int) (int64, error) {
+func (q query) GetCovering(level int) []s2.CellID {
 	var r s2.Region
 	switch q.shape {
 	case cellShape:
@@ -147,6 +150,52 @@ func (q query) ReadS2(db *sql.DB, cfg *s2IndexConfig, level int) (int64, error) 
 		panic(`unhandled shape: ` + q.shape)
 	}
 	covering := cfg.Covering(r)
+	if len(covering) > len(queryCoveringCounts) {
+		panic("")
+	}
+	queryCoveringCounts[len(covering)]++
+	return covering
+}
+
+func (q query) ReadSST(r *sstable.Reader, level int) (int, int, error) {
+	covering := q.GetCovering(level)
+	if covering == nil {
+		// Couldn't do this covering.
+		return 0, 0, errQuerySkipped
+	}
+	if q.op != containsOperation {
+		panic("unsupported operation")
+	}
+	iter := r.NewIter(nil, nil)
+	idMap := make(map[uint64]struct{})
+	var rowCount int
+	for _, c := range covering {
+		first := []byte(c.RangeMin().ToToken())
+		last := []byte(c.RangeMax().ToToken())
+		var k *pebble.InternalKey
+		var v []byte
+		for k, v = iter.SeekGE(first); k != nil && bytes.Compare(k.UserKey, last) <= 0; k, v = iter.Next() {
+			id, n := binary.Uvarint(v)
+			if n <= 0 {
+				panic("unable to parse varint")
+			}
+			if _, ok := idMap[id]; !ok {
+				idMap[id] = struct{}{}
+			}
+			// idMap[id] = struct{}{}
+			rowCount++
+		}
+	}
+
+	if err := iter.Close(); err != nil {
+		return 0, 0, err
+	}
+	return len(idMap), rowCount, nil
+}
+
+func (q query) ReadS2(db *sql.DB, cfg *s2IndexConfig, level int, printQuery bool) (int64, error) {
+	covering := q.GetCovering(level)
+
 	if covering == nil {
 		// Couldn't do this covering.
 		return 0, errQuerySkipped
@@ -154,7 +203,7 @@ func (q query) ReadS2(db *sql.DB, cfg *s2IndexConfig, level int) (int64, error) 
 
 	var queryBuf bytes.Buffer
 	queryBuf.WriteString(`SELECT `)
-	if cfg.maxCells == 1 || true {
+	if cfg.maxCells == 1 {
 		// Take advantage of the fact that there's only one cell indexed for each
 		// shape.
 		queryBuf.WriteString(`count(id)`)
@@ -167,6 +216,8 @@ func (q query) ReadS2(db *sql.DB, cfg *s2IndexConfig, level int) (int64, error) 
 		containsQ(&queryBuf, covering)
 	case containingOperation:
 		containingQ(&queryBuf, append(ancestorCells(covering...), covering...))
+		// containingQ(&queryBuf, append(ancestorCells(covering...)))
+		// containingQ(&queryBuf, covering)
 	case intersectsOperation:
 		containsQ(&queryBuf, covering)
 		queryBuf.WriteString(` OR `)
@@ -180,6 +231,9 @@ func (q query) ReadS2(db *sql.DB, cfg *s2IndexConfig, level int) (int64, error) 
 	// TODO(dan): Prepare all these. A little tricky since containing and
 	// intersects each need a one version for each cell level.
 	var count int64
+	if printQuery && false {
+		fmt.Printf("%s\n", queryBuf.String())
+	}
 	err := db.QueryRow(queryBuf.String()).Scan(&count)
 	err = errors.Wrapf(err, `executing: %s`, queryBuf.String())
 	return count, err

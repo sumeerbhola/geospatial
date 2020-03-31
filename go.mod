@@ -3,6 +3,7 @@ module crdbs2
 go 1.12
 
 require (
+	github.com/cockroachdb/pebble v0.0.0-20200331011042-7de3fc63b7c9 // indirect
 	github.com/codahale/hdrhistogram v0.0.0-20161010025455-3a0bb77429bd
 	github.com/golang/geo v0.0.0-20190916061304-5b978397cfec
 	github.com/lib/pq v1.2.0
